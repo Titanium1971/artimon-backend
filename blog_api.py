@@ -1,7 +1,7 @@
 """
 Blog API - Complete blog system with admin dashboard
 """
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -13,6 +13,19 @@ import re
 import hashlib
 import secrets
 from pathlib import Path
+import asyncio
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Import for translation
+try:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
+    TRANSLATION_ENABLED = True
+except ImportError:
+    TRANSLATION_ENABLED = False
+    print("Warning: emergentintegrations not installed. Auto-translation disabled.")
 
 # Create router
 blog_router = APIRouter(prefix="/api/blog", tags=["blog"])
@@ -112,6 +125,83 @@ def serialize_article(article: dict) -> dict:
         "created_at": article["created_at"],
         "updated_at": article["updated_at"]
     }
+
+# ==================== AUTO-TRANSLATION ====================
+
+async def translate_article_to_english(article_doc: dict):
+    """Automatically translate a French article to English using GPT"""
+    if not TRANSLATION_ENABLED:
+        print("Translation disabled - emergentintegrations not available")
+        return None
+    
+    # Skip if article is already in English
+    if article_doc.get("tags") and "english" in article_doc.get("tags", []):
+        return None
+    
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        print("Warning: EMERGENT_LLM_KEY not set. Auto-translation disabled.")
+        return None
+    
+    try:
+        # Initialize the chat
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"translate-{article_doc.get('slug', 'article')}",
+            system_message="""You are a professional translator specializing in tourism and cycling content. 
+Translate the following French text to English. 
+Keep all emojis, markdown formatting (##, ###, -, **), and structure intact.
+Translate naturally, not word-for-word. Adapt expressions for English-speaking audiences.
+Keep place names (Marseillan, Sète, Bouzigues, etc.) unchanged.
+Keep the business info: Artimon Bike, phone numbers, and addresses unchanged."""
+        ).with_model("openai", "gpt-4.1-mini")
+        
+        # Translate title
+        title_msg = UserMessage(text=f"Translate this article title to English (just the translation, nothing else):\n{article_doc['title']}")
+        english_title = await chat.send_message(title_msg)
+        english_title = english_title.strip().strip('"').strip("'")
+        
+        # Translate excerpt
+        excerpt_msg = UserMessage(text=f"Translate this article excerpt to English (just the translation, nothing else):\n{article_doc['excerpt']}")
+        english_excerpt = await chat.send_message(excerpt_msg)
+        english_excerpt = english_excerpt.strip().strip('"').strip("'")
+        
+        # Translate content
+        content_msg = UserMessage(text=f"Translate this article content to English (keep all markdown formatting):\n\n{article_doc['content']}")
+        english_content = await chat.send_message(content_msg)
+        
+        # Generate English slug
+        english_slug = generate_slug(english_title)
+        
+        # Check if slug exists
+        existing = await db.articles.find_one({"slug": english_slug})
+        if existing:
+            english_slug = f"{english_slug}-{str(uuid.uuid4())[:8]}"
+        
+        # Create English article
+        now = datetime.now(timezone.utc)
+        english_article = {
+            "title": english_title,
+            "slug": english_slug,
+            "content": english_content,
+            "excerpt": english_excerpt,
+            "image_url": article_doc.get("image_url"),
+            "category": article_doc["category"],
+            "tags": ["english"],
+            "meta_description": english_excerpt[:160] if english_excerpt else None,
+            "status": article_doc["status"],
+            "created_at": now,
+            "updated_at": now,
+            "translated_from": str(article_doc.get("_id", ""))
+        }
+        
+        result = await db.articles.insert_one(english_article)
+        print(f"✅ Auto-translated article created: {english_title} (ID: {result.inserted_id})")
+        return result.inserted_id
+        
+    except Exception as e:
+        print(f"❌ Translation error: {str(e)}")
+        return None
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify admin token"""
@@ -244,8 +334,12 @@ async def admin_get_article(article_id: str, token_data: dict = Depends(verify_t
     return serialize_article(article)
 
 @admin_router.post("/articles")
-async def create_article(article: ArticleCreate, token_data: dict = Depends(verify_token)):
-    """Create new article"""
+async def create_article(
+    article: ArticleCreate, 
+    background_tasks: BackgroundTasks,
+    token_data: dict = Depends(verify_token)
+):
+    """Create new article with automatic English translation"""
     slug = generate_slug(article.title)
     
     # Check if slug already exists
@@ -263,6 +357,11 @@ async def create_article(article: ArticleCreate, token_data: dict = Depends(veri
     
     result = await db.articles.insert_one(article_doc)
     article_doc["_id"] = result.inserted_id
+    
+    # Auto-translate to English if it's a French article (no "english" tag)
+    if "english" not in article.tags:
+        # Run translation in background
+        background_tasks.add_task(translate_article_to_english, article_doc.copy())
     
     return serialize_article(article_doc)
 
@@ -391,3 +490,98 @@ async def get_stats(token_data: dict = Depends(verify_token)):
         "drafts": drafts,
         "categories": categories
     }
+
+
+# ==================== REVIEWS SYSTEM ====================
+
+reviews_router = APIRouter(prefix="/api/reviews", tags=["reviews"])
+
+class ReviewBase(BaseModel):
+    author_name: str
+    rating: int = Field(ge=1, le=5)
+    text: str
+    date: str
+    language: str = "fr"  # fr or en
+    source: str = "google"  # google, lokki, etc.
+    highlight: Optional[str] = None
+
+class ReviewCreate(ReviewBase):
+    pass
+
+@reviews_router.get("")
+async def get_reviews(language: Optional[str] = None, limit: int = 10):
+    """Get published reviews"""
+    query = {"status": "published"}
+    if language:
+        query["language"] = language
+    
+    cursor = db.reviews.find(query).sort("created_at", -1).limit(limit)
+    reviews = await cursor.to_list(length=limit)
+    
+    # Calculate stats
+    all_reviews = await db.reviews.find({"status": "published"}).to_list(length=1000)
+    total_reviews = len(all_reviews)
+    avg_rating = sum(r.get("rating", 5) for r in all_reviews) / total_reviews if total_reviews > 0 else 4.6
+    
+    return {
+        "reviews": [{
+            "id": str(r["_id"]),
+            "author_name": r["author_name"],
+            "rating": r["rating"],
+            "text": r["text"],
+            "date": r["date"],
+            "language": r.get("language", "fr"),
+            "source": r.get("source", "google"),
+            "highlight": r.get("highlight"),
+            "initials": "".join([n[0].upper() for n in r["author_name"].split()[:2]])
+        } for r in reviews],
+        "stats": {
+            "total_reviews": total_reviews,
+            "average_rating": round(avg_rating, 1),
+            "google_place_id": "ChIJxxxxxxxx"  # Replace with actual Place ID
+        }
+    }
+
+@admin_router.get("/reviews")
+async def admin_get_reviews(token_data: dict = Depends(verify_token)):
+    """Get all reviews for admin"""
+    cursor = db.reviews.find({}).sort("created_at", -1)
+    reviews = await cursor.to_list(length=1000)
+    return [{
+        "id": str(r["_id"]),
+        "author_name": r["author_name"],
+        "rating": r["rating"],
+        "text": r["text"],
+        "date": r["date"],
+        "language": r.get("language", "fr"),
+        "source": r.get("source", "google"),
+        "highlight": r.get("highlight"),
+        "status": r.get("status", "published"),
+        "created_at": r.get("created_at")
+    } for r in reviews]
+
+@admin_router.post("/reviews")
+async def create_review(review: ReviewCreate, token_data: dict = Depends(verify_token)):
+    """Create a new review"""
+    now = datetime.now(timezone.utc)
+    review_doc = {
+        **review.model_dump(),
+        "status": "published",
+        "created_at": now,
+        "updated_at": now
+    }
+    result = await db.reviews.insert_one(review_doc)
+    return {"id": str(result.inserted_id), "message": "Avis créé avec succès"}
+
+@admin_router.delete("/reviews/{review_id}")
+async def delete_review(review_id: str, token_data: dict = Depends(verify_token)):
+    """Delete a review"""
+    try:
+        result = await db.reviews.delete_one({"_id": ObjectId(review_id)})
+    except:
+        raise HTTPException(status_code=400, detail="ID invalide")
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Avis non trouvé")
+    
+    return {"message": "Avis supprimé"}
