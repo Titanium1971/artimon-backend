@@ -272,11 +272,11 @@ async def get_analytics_stats():
     published_articles = await db.articles.count_documents({"status": "published"})
     draft_articles = await db.articles.count_documents({"status": "draft"})
     
-    # Recent contact messages
+    # Recent contact messages - include full message content
     recent_contacts = await db.contact_messages.find(
         {}, 
-        {"_id": 0, "name": 1, "email": 1, "subject": 1, "status": 1, "created_at": 1}
-    ).sort("created_at", -1).limit(10).to_list(10)
+        {"_id": 0, "name": 1, "email": 1, "phone": 1, "subject": 1, "message": 1, "status": 1, "created_at": 1}
+    ).sort("created_at", -1).limit(50).to_list(50)
     
     # Convert datetime to ISO string for JSON serialization
     for contact in recent_contacts:
@@ -310,6 +310,30 @@ async def get_analytics_stats():
         },
         "recent_contacts": recent_contacts
     }
+
+@api_router.delete("/analytics/contacts/{contact_email}/{contact_date}")
+async def delete_contact_message(contact_email: str, contact_date: str):
+    """Delete a contact message by email and date"""
+    from urllib.parse import unquote
+    
+    email = unquote(contact_email)
+    
+    # Try to parse the date
+    try:
+        date = datetime.fromisoformat(contact_date.replace('Z', '+00:00'))
+        # Delete by email and approximate date (within 1 second)
+        result = await db.contact_messages.delete_one({
+            "email": email,
+            "created_at": {"$gte": date - timedelta(seconds=1), "$lte": date + timedelta(seconds=1)}
+        })
+    except:
+        # Fallback: delete by email only (first match)
+        result = await db.contact_messages.delete_one({"email": email})
+    
+    if result.deleted_count > 0:
+        return {"status": "success", "message": "Message supprimé"}
+    else:
+        raise HTTPException(status_code=404, detail="Message non trouvé")
 
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
