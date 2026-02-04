@@ -239,6 +239,78 @@ async def get_google_api_key():
         raise HTTPException(status_code=500, detail="Google API key not configured")
     return {"key": api_key}
 
+# ==================== ANALYTICS DASHBOARD ====================
+@api_router.get("/analytics/stats")
+async def get_analytics_stats():
+    """Get analytics statistics for the admin dashboard"""
+    from datetime import timedelta
+    
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=7)
+    month_start = today_start - timedelta(days=30)
+    
+    # Contact messages stats
+    total_contacts = await db.contact_messages.count_documents({})
+    contacts_today = await db.contact_messages.count_documents({
+        "created_at": {"$gte": today_start}
+    })
+    contacts_week = await db.contact_messages.count_documents({
+        "created_at": {"$gte": week_start}
+    })
+    contacts_month = await db.contact_messages.count_documents({
+        "created_at": {"$gte": month_start}
+    })
+    
+    # Contact messages by status
+    contacts_sent = await db.contact_messages.count_documents({"status": "sent"})
+    contacts_pending = await db.contact_messages.count_documents({"status": "pending"})
+    contacts_error = await db.contact_messages.count_documents({"status": "error"})
+    
+    # Blog articles stats
+    total_articles = await db.articles.count_documents({})
+    published_articles = await db.articles.count_documents({"status": "published"})
+    draft_articles = await db.articles.count_documents({"status": "draft"})
+    
+    # Recent contact messages
+    recent_contacts = await db.contact_messages.find(
+        {}, 
+        {"_id": 0, "name": 1, "email": 1, "subject": 1, "status": 1, "created_at": 1}
+    ).sort("created_at", -1).limit(10).to_list(10)
+    
+    # Convert datetime to ISO string for JSON serialization
+    for contact in recent_contacts:
+        if contact.get("created_at"):
+            contact["created_at"] = contact["created_at"].isoformat()
+    
+    # Contact messages by subject
+    pipeline = [
+        {"$group": {"_id": "$subject", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    subjects_stats = await db.contact_messages.aggregate(pipeline).to_list(10)
+    
+    return {
+        "contacts": {
+            "total": total_contacts,
+            "today": contacts_today,
+            "week": contacts_week,
+            "month": contacts_month,
+            "by_status": {
+                "sent": contacts_sent,
+                "pending": contacts_pending,
+                "error": contacts_error
+            },
+            "by_subject": [{"subject": s["_id"], "count": s["count"]} for s in subjects_stats]
+        },
+        "articles": {
+            "total": total_articles,
+            "published": published_articles,
+            "draft": draft_articles
+        },
+        "recent_contacts": recent_contacts
+    }
+
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
 async def root():
